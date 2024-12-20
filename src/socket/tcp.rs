@@ -1243,6 +1243,54 @@ impl<'a> Socket<'a> {
         Ok(result)
     }
 
+    fn send_recv_impl<'b, F, R>(&'b mut self, f: F) -> R
+    where
+        F: FnOnce(
+            Result<&'b mut SocketBuffer<'a>, RecvError>,
+            Result<&'b mut SocketBuffer<'a>, SendError>,
+        ) -> (usize, usize, R),
+    {
+        let rx_status = self.recv_error_check();
+        let tx_status = if !self.may_send() {
+            Err(SendError::InvalidState)
+        } else {
+            Ok(())
+        };
+
+        let tx_old_length = self.tx_buffer.len();
+        let _rx_old_length = self.rx_buffer.len();
+        let (rx_size, tx_size, result) = f(
+            rx_status.and(Ok(&mut self.rx_buffer)),
+            tx_status.and(Ok(&mut self.tx_buffer)),
+        );
+        self.remote_seq_no += rx_size;
+        if rx_size > 0 {
+            #[cfg(any(test, feature = "verbose"))]
+            tcp_trace!(
+                "rx buffer: dequeueing {} octets (now {})",
+                size,
+                _rx_old_length - size
+            );
+        }
+
+        if tx_size > 0 {
+            // The connection might have been idle for a long time, and so remote_last_ts
+            // would be far in the past. Unless we clear it here, we'll abort the connection
+            // down over in dispatch() by erroneously detecting it as timed out.
+            if tx_old_length == 0 {
+                self.remote_last_ts = None
+            }
+
+            #[cfg(any(test, feature = "verbose"))]
+            tcp_trace!(
+                "tx buffer: enqueueing {} octets (now {})",
+                tx_size,
+                tx_old_length + tx_size
+            );
+        }
+        result
+    }
+
     /// Call `f` with the largest contiguous slice of octets in the receive buffer,
     /// and dequeue the amount of elements returned by `f`.
     ///
@@ -1258,6 +1306,66 @@ impl<'a> Socket<'a> {
         F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
         self.recv_impl(|rx_buffer| rx_buffer.dequeue_many_with(f))
+    }
+
+    /// Call `f` with the largest contiguous slice of octets in the receive
+    /// buffer and send buffer (if available), and dequeue the amount of
+    /// elements returned by `f().0` from the receive buffer, and `f().1` from the
+    /// transmit buffer; `f().2` is passed through as the result.
+    ///
+    /// If either the receiver half or the transmit side of the connection had
+    /// been closed, `f` will be called with a `RecvError` (or `SendError`)
+    /// instead of `Ok(buf)`; `f` will always be called.
+    ///
+    /// If the receive half has been gracefully closed (with a FIN packet),
+    /// `Err(Error::Finished)` is passed. In this case, the previously received
+    /// data is guaranteed to be complete. In all other cases,
+    /// `Err(Error::Illegal)` is passed for the receive buffer, and previously
+    /// received data (if any) may be incomplete (truncated).
+    ///
+    /// This function passes `Err(Error::Illegal)` as the transmit buffer if the
+    /// transmit half of the connection is not open; see
+    /// [may_send](#method.may_send).
+    ///
+    /// If a transmit or receive buffer is not passed through (i.e. an `Err` is
+    /// passed), then the returned amount of elements to remove for that buffer
+    /// must be 0.
+    pub fn send_recv<'b, F, R>(&'b mut self, f: F) -> R
+    where
+        F: FnOnce(
+            Result<&'b mut [u8], RecvError>,
+            Result<&'b mut [u8], SendError>,
+        ) -> (usize, usize, R),
+    {
+        self.send_recv_impl(|rx_buffer, tx_buffer| {
+            let (rx_size, (tx_size, r)) = match (rx_buffer, tx_buffer) {
+                (Ok(rx_buffer), Ok(tx_buffer)) => rx_buffer.dequeue_many_with(|rx| {
+                    let (tx_size, (rx_size, r)) = tx_buffer.enqueue_many_with(|tx| {
+                        let (rx_size, tx_size, r) = f(Ok(rx), Ok(tx));
+                        (tx_size, (rx_size, r))
+                    });
+                    (rx_size, (tx_size, r))
+                }),
+                (Ok(rx_buffer), Err(tx_err)) => rx_buffer.dequeue_many_with(|rx| {
+                    let (rx_size, tx_size, r) = f(Ok(rx), Err(tx_err));
+                    assert!(tx_size == 0);
+                    (rx_size, (tx_size, r))
+                }),
+                (Err(rx_err), Ok(tx_buffer)) => tx_buffer.enqueue_many_with(|tx| {
+                    let (rx_size, tx_size, r) = f(Err(rx_err), Ok(tx));
+                    assert!(rx_size == 0);
+                    (tx_size, (rx_size, r))
+                }),
+                (Err(rx_err), Err(tx_err)) => {
+                    let (rx_size, tx_size, r) = f(Err(rx_err), Err(tx_err));
+                    assert!(rx_size == 0);
+                    assert!(tx_size == 0);
+                    (tx_size, (rx_size, r))
+                }
+            };
+
+            (rx_size, tx_size, r)
+        })
     }
 
     /// Dequeue a sequence of received octets, and fill a slice from it.
