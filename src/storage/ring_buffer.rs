@@ -109,6 +109,26 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     fn get_idx_unchecked(&self, idx: usize) -> usize {
         (self.read_at + idx) % self.capacity()
     }
+
+    // Moves the valid bytes, plus `additional_bytes`, to the beginning of the buffer.
+    pub fn linearize(&mut self, additional_elements: usize)
+    where
+        T: Copy,
+    {
+        let valid_elements = self.len() + additional_elements;
+
+        if valid_elements > self.contiguous_window() {
+            // There is valid data at the beginning of the buffer, `rotate_left`
+            // can deal with overlapping data.
+            self.storage.rotate_left(self.read_at);
+        } else {
+            // No valid data at the beginning of the buffer.
+            self.storage
+                .copy_within(self.read_at..self.read_at + valid_elements, 0);
+        }
+
+        self.read_at = 0;
+    }
 }
 
 /// This is the "discrete" ring buffer interface: it operates with single elements,

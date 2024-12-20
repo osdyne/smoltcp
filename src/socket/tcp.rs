@@ -1312,6 +1312,25 @@ impl<'a> Socket<'a> {
         self.rx_buffer.len()
     }
 
+    /// Linearizes the receive buffer to maximize the number of contiguous octets by
+    /// rotating the buffer so that the read pointer is at the start position.
+    ///
+    /// Octets that are not currently occupied are invalidated (i.e. not moved).
+    pub fn linearize_recv_buffer(&mut self) {
+        self.rx_buffer.linearize(0);
+    }
+
+    /// Linearizes the empty transmit buffer to maximize the number of
+    /// contiguous octets by rotating the buffer so that the write pointer is at
+    /// the start position.
+    ///
+    /// An additional number of `pending` octets, in front of the occupied
+    /// buffer, are considered as valid, but octets that are neither in the
+    /// currently occupied or pending region are invalidated (i.e. not moved).
+    pub fn linearize_send_buffer(&mut self, pending: usize) {
+        self.tx_buffer.linearize(pending);
+    }
+
     fn set_state(&mut self, state: State) {
         if self.state != state {
             tcp_trace!("state={}=>{}", self.state, state);
