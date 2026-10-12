@@ -1358,8 +1358,8 @@ impl<'a> Socket<'a> {
             #[cfg(any(test, feature = "verbose"))]
             tcp_trace!(
                 "rx buffer: dequeueing {} octets (now {})",
-                size,
-                _rx_old_length - size
+                rx_size,
+                _rx_old_length - rx_size
             );
         }
 
