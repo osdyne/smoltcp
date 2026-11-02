@@ -106,6 +106,23 @@ impl Slaac {
         }
     }
 
+    /// Restart router discovery.
+    ///
+    /// All prefixes and routes are marked as expired.
+    pub(crate) fn reset(&mut self) {
+        for info in self.prefix.values_mut() {
+            info.valid_until = Instant::from_millis(0);
+            info.preferred_until = Instant::from_millis(0);
+        }
+        for route in self.routes.iter_mut() {
+            route.valid_until = Instant::from_millis(0);
+        }
+        self.phase = Phase::Start;
+        self.retry_rs_at = Instant::from_millis(0);
+        self.num_solicitations = MAX_RTR_SOLICITATIONS;
+        self.sync_required = true;
+    }
+
     /// Get whether router advertisement information is updated.
     ///
     /// This flags whether new prefixes or routes have been received, or current prefixes and
@@ -274,7 +291,13 @@ impl Slaac {
     /// Get the next time the SLAAC state must be polled for updates.
     pub(crate) fn poll_at(&self, now: Instant) -> Option<Instant> {
         match self.phase {
-            Phase::Discovering | Phase::Start => Some(self.retry_rs_at),
+            Phase::Discovering | Phase::Start => {
+                if self.num_solicitations > 0 {
+                    Some(self.retry_rs_at)
+                } else {
+                    None
+                }
+            }
             Phase::Maintaining => {
                 let prefix_at = self.prefix.values().filter_map(|prefix_info| {
                     if prefix_info.is_valid(now) {
@@ -434,6 +457,69 @@ mod test {
         assert_eq!(slaac.prefix().len(), 0);
 
         // No state remaining, nothing to wait on
+        assert!(slaac.poll_at(now).is_none());
+    }
+
+    #[test]
+    fn test_reset_addrs_routes() {
+        let mut slaac = Slaac::new();
+        let now = Instant::from_millis(1);
+        slaac.rs_sent(now);
+        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), now);
+        assert_eq!(slaac.prefix().len(), 1);
+        assert_eq!(slaac.routes().len(), 1);
+        slaac.update_slaac_state(now);
+        assert!(!slaac.sync_required(now));
+
+        slaac.reset();
+
+        // Old addresses and routes will be removed: they are kept around as expired until the
+        // interface has been synchronized.
+        assert!(slaac.has_ra_update());
+        assert!(slaac.sync_required(now));
+        for (_prefix, info) in slaac.prefix() {
+            assert!(!info.is_valid(now));
+        }
+        for route in slaac.routes() {
+            assert!(!route.is_valid(now));
+        }
+
+        slaac.update_slaac_state(now);
+        assert!(!slaac.sync_required(now));
+        assert_eq!(slaac.prefix().len(), 0);
+        assert_eq!(slaac.routes().len(), 0);
+
+        // A solicitation is due immediately.
+        assert!(slaac.rs_required(now));
+        assert!(slaac.poll_at(now).unwrap() <= now);
+    }
+
+    #[test]
+    fn test_reset_solicitations() {
+        let mut slaac = Slaac::new();
+        let mut now = Instant::from_millis(1);
+        // Send all solicitations.
+        for _ in 0..MAX_RTR_SOLICITATIONS {
+            assert!(slaac.rs_required(now));
+            slaac.rs_sent(now);
+            now += RTR_SOLICITATION_INTERVAL;
+        }
+        // No more solicitations to send.
+        assert!(!slaac.rs_required(now));
+        assert!(slaac.poll_at(now).is_none());
+
+        slaac.reset();
+
+        // Discovery is restarted.
+        assert_eq!(slaac.phase, Phase::Start);
+        for _ in 0..MAX_RTR_SOLICITATIONS {
+            assert!(slaac.rs_required(now));
+            slaac.rs_sent(now);
+            assert_eq!(slaac.phase, Phase::Discovering);
+            now += RTR_SOLICITATION_INTERVAL;
+        }
+        // No more solicitations to send.
+        assert!(!slaac.rs_required(now));
         assert!(slaac.poll_at(now).is_none());
     }
 
